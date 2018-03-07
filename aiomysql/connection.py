@@ -710,13 +710,82 @@ class Connection:
             plugin_name = auth_packet.read_string()
             if (self.server_capabilities & CLIENT.PLUGIN_AUTH and
                     plugin_name is not None):
-                auth_packet = self._process_auth(plugin_name, auth_packet)
+                auth_packet = yield from self._process_auth(
+                    plugin_name, auth_packet)
             else:
                 # send legacy handshake
                 data = _scramble_323(self._password.encode('latin1'),
                                      self.salt) + b'\0'
                 self.write_packet(data)
                 auth_packet = yield from self._read_packet()
+
+    @asyncio.coroutine
+    def _process_auth(self, plugin_name, auth_packet):
+        handler = None
+        if plugin_name == b"mysql_native_password":
+            # https://dev.mysql.com/doc/internals/en/
+            # secure-password-authentication.html#packet-Authentication::
+            # Native41
+            data = _scramble(self._password.encode('latin1'),
+                             auth_packet.read_all())
+        elif plugin_name == b"mysql_old_password":
+            # https://dev.mysql.com/doc/internals/en/
+            # old-password-authentication.html
+            data = _scramble_323(self._password.encode('latin1'),
+                                 auth_packet.read_all()) + b'\0'
+        elif plugin_name == b"mysql_clear_password":
+            # https://dev.mysql.com/doc/internals/en/
+            # clear-text-authentication.html
+            data = self._password.encode('latin1') + b'\0'
+        elif plugin_name == b"dialog":
+            pkt = auth_packet
+            while True:
+                flag = pkt.read_uint8()
+                echo = (flag & 0x06) == 0x02
+                last = (flag & 0x01) == 0x01
+                prompt = pkt.read_all()
+
+                if prompt == b"Password: ":
+                    self.write_packet(self._password.encode('latin1') + b'\0')
+                elif handler:
+                    resp = ('no response - TypeError within '
+                            'plugin.prompt method')
+                    try:
+                        resp = handler.prompt(echo, prompt)
+                        self.write_packet(resp + b'\0')
+                    except AttributeError:
+                        raise OperationalError(
+                            2059,
+                            ("Authentication plugin '%s'"
+                             " not loaded: - %r missing prompt method") %
+                            (plugin_name, handler))
+                    except TypeError:
+                        raise OperationalError(
+                            2061,
+                            ("Authentication plugin '%s' %r didn't respond "
+                             "with string. Returned '%r' to prompt %r") %
+                            (plugin_name, handler, resp, prompt)
+                        )
+                else:
+                    raise OperationalError(
+                        2059,
+                        "Authentication plugin '%s' (%r) not configured" %
+                        (plugin_name, handler)
+                    )
+                pkt = yield from self._read_packet()
+                pkt.check_error()
+                if pkt.is_ok_packet() or last:
+                    break
+            return pkt
+        else:
+            raise OperationalError(
+                2059, "Authentication plugin '%s' not configured" % plugin_name
+            )
+
+        self.write_packet(data)
+        pkt = yield from self._read_packet()
+        pkt.check_error()
+        return pkt
 
     # _mysql support
     def thread_id(self):
